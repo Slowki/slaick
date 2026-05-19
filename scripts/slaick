@@ -1304,15 +1304,17 @@ def command_search(
     "--lines",
     "line_count",
     "-n",
-    default=10,
-    show_default=True,
+    default=None,
+    show_default="10, or 0 with --follow",
     type=click.IntRange(0),
     help="Recent messages to print.",
 )
 @click.option("--follow", "follow", "-f", is_flag=True, help="Keep watching for new messages.")
 @click.pass_obj
-def command_tail(command_context: SlaickContext, target: str, line_count: int, follow: bool) -> None:
+def command_tail(command_context: SlaickContext, target: str, line_count: int | None, follow: bool) -> None:
     """Watch a Slack conversation."""
+    if line_count is None:
+        line_count = 0 if follow else 10
     channel_id = resolve_conversation_id(command_context, target)
     format_context = get_message_format_context(command_context)
     output_tail_history(command_context, channel_id, line_count, format_context)

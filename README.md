@@ -59,8 +59,13 @@ slaick send @me 'hello from slaick'
 slaick dm alice 'hello from slaick'
 slaick dm U123456 'hello from slaick'
 
-# Print and follow recent messages
+# Follow new messages without history
+slaick tail -f general
+
+# Follow after printing recent messages
 slaick tail -n 20 -f general
+
+# Print recent direct messages
 slaick tail @alice
 
 # Forget cached token
