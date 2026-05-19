@@ -79,6 +79,15 @@ Send a message to a channel:
 
 ```bash
 scripts/slaick send random 'hello from slaick'
+printf 'hello from stdin' | scripts/slaick send random
+```
+
+Upload files to a channel:
+
+```bash
+scripts/slaick send random --file report.txt
+scripts/slaick send random 'see attached' --file report.txt --file chart.png
+printf 'generated summary' | scripts/slaick send random --file summary.md
 ```
 
 Send a direct message:
@@ -86,7 +95,13 @@ Send a direct message:
 ```bash
 scripts/slaick send @alice 'hello from slaick'
 scripts/slaick send @me 'test message'
+printf 'hello from stdin' | scripts/slaick dm alice
+scripts/slaick dm alice --file report.txt
 ```
+
+When `send` or `dm` omits the message argument, pipe the message body through standard input.
+This is useful for generated multi-line messages. When `--file` is provided,
+the message body is optional and becomes the upload comment.
 
 Reply in a thread when the thread timestamp is known:
 
@@ -95,7 +110,8 @@ scripts/slaick send general 'reply text' --thread-ts 1716153058.123456
 scripts/slaick dm alice 'reply text' --thread-ts 1716153058.123456
 ```
 
-Treat Slack writes as live side effects. Only send messages when the user has asked for that action and clearly approved the exact content.
+Treat Slack writes as live side effects. Only send messages when the user has
+asked for that action and clearly approved the exact content.
 
 ## Tail and Wait for Responses
 
@@ -121,7 +137,8 @@ wait is no longer useful.
 
 ## Debugging
 
-If a command fails with `workspace is required`, ask the user for the name of their slack workspace and set the default workspace:
+If a command fails with `workspace is required`, ask the user for the name of
+their Slack workspace and set the default workspace:
 
 ```bash
 scripts/slaick set-workspace myworkspace
@@ -134,7 +151,8 @@ Use a one-command workspace override when testing a workspace without changing t
 scripts/slaick --workspace myworkspace user --me
 ```
 
-If authentication fails with `invalid_auth`, `token_revoked`, `not_authed`, or `account_inactive`, refresh the cached token and workspace cache:
+If authentication fails with `invalid_auth`, `token_revoked`, `not_authed`, or
+`account_inactive`, refresh the cached token and workspace cache:
 
 ```bash
 scripts/slaick logout

@@ -864,23 +864,62 @@ def resolve_send_target(command_context: SlaickContext, target: str) -> tuple[st
     raise SlaickError(f"channel not found: {normalized_target}")
 
 
+def render_send_target(target_name: str, target_type: str) -> str:
+    """Render a send target for command output."""
+    return slack_handle(target_name) if target_type == "user" else f"#{target_name}"
+
+
 def send_message(
     command_context: SlaickContext,
     target: str,
-    text: str,
+    text: str | None,
     thread_ts: str | None = None,
+    file_paths: tuple[Path, ...] = (),
 ) -> None:
-    """Send a Slack message."""
+    """Send a Slack message or file upload."""
     channel_id, target_name, target_type = resolve_send_target(command_context, target)
-    parameters: JsonObject = {"channel": channel_id, "text": text}
+    rendered_target = render_send_target(target_name, target_type)
+    if file_paths:
+        file_uploads = [
+            {"file": str(file_path), "filename": file_path.name, "title": file_path.name}
+            for file_path in file_paths
+        ]
+        parameters: JsonObject = {"channel": channel_id, "file_uploads": file_uploads}
+        if text:
+            parameters["initial_comment"] = text
+        if thread_ts:
+            parameters["thread_ts"] = thread_ts
+        call_with_refresh(command_context, "files_upload_v2", **parameters)
+        suffix = "" if len(file_paths) == 1 else "s"
+        click.echo(f"Uploaded {len(file_paths)} file{suffix} to {rendered_target}.")
+        return
+
+    if text is None:
+        raise SlaickError("message text is required unless --file is provided")
+    parameters = {"channel": channel_id, "text": text}
     if thread_ts:
         parameters["thread_ts"] = thread_ts
     result = call_with_refresh(command_context, "chat_postMessage", **parameters)
     message = result.get("message", {})
     message_timestamp = message.get("ts") if isinstance(message, dict) else None
     timestamp = result.get("ts") or message_timestamp
-    rendered_target = slack_handle(target_name) if target_type == "user" else f"#{target_name}"
     click.echo(f"Sent message to {rendered_target} at {format_slack_timestamp(timestamp)}.")
+
+
+def get_message_text(text: str | None, *, require_text: bool) -> str | None:
+    """Read message text from an argument or standard input."""
+    if text is not None:
+        return text
+    if sys.stdin.isatty():
+        if require_text:
+            raise SlaickError("message text is required unless provided on stdin or --file is provided")
+        return None
+    standard_input_text = sys.stdin.read().rstrip("\n")
+    if not standard_input_text:
+        if require_text:
+            raise SlaickError("message text from stdin is empty")
+        return None
+    return standard_input_text
 
 
 def load_user_display_names(command_context: SlaickContext) -> dict[str, str]:
@@ -1324,22 +1363,50 @@ def command_tail(command_context: SlaickContext, target: str, line_count: int | 
 
 @cli.command("send")
 @click.argument("target")
-@click.argument("text")
+@click.argument("text", required=False)
+@click.option(
+    "--file",
+    "file_paths",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="File path to upload. May be used more than once.",
+)
 @click.option("--thread-ts", help="Optional thread timestamp.")
 @click.pass_obj
-def command_send(command_context: SlaickContext, target: str, text: str, thread_ts: str | None) -> None:
+def command_send(
+    command_context: SlaickContext,
+    target: str,
+    text: str | None,
+    file_paths: tuple[Path, ...],
+    thread_ts: str | None,
+) -> None:
     """Send a message."""
-    send_message(command_context, target, text, thread_ts)
+    message_text = get_message_text(text, require_text=not file_paths)
+    send_message(command_context, target, message_text, thread_ts, file_paths)
 
 
 @cli.command("dm")
 @click.argument("user")
-@click.argument("text")
+@click.argument("text", required=False)
+@click.option(
+    "--file",
+    "file_paths",
+    multiple=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="File path to upload. May be used more than once.",
+)
 @click.option("--thread-ts", help="Optional thread timestamp.")
 @click.pass_obj
-def command_direct_message(command_context: SlaickContext, user: str, text: str, thread_ts: str | None) -> None:
+def command_direct_message(
+    command_context: SlaickContext,
+    user: str,
+    text: str | None,
+    file_paths: tuple[Path, ...],
+    thread_ts: str | None,
+) -> None:
     """Send a direct message."""
-    send_message(command_context, f"@{user.removeprefix('@')}", text, thread_ts)
+    message_text = get_message_text(text, require_text=not file_paths)
+    send_message(command_context, f"@{user.removeprefix('@')}", message_text, thread_ts, file_paths)
 
 
 @cli.command("logout")
