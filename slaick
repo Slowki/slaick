@@ -1,0 +1,1385 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#   "click",
+#   "cryptography",
+#   "secretstorage",
+#   "slack-sdk",
+#   "websocket-client",
+# ]
+# ///
+"""slaick: a small Slack CLI for AI agents."""
+
+from contextlib import closing, suppress
+from datetime import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Final, cast
+
+import click
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import secretstorage
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.slack_response import SlackResponse
+from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException, create_connection
+
+type JsonObject = dict[str, Any]
+
+SESSION_TOKEN_PATTERN: Final = re.compile(r'xoxc-[^"]+')
+DEFAULT_TIMEOUT_SECONDS: Final = 30
+USER_CACHE_MAX_AGE_SECONDS: Final = 7 * 24 * 60 * 60
+CONVERSATION_CACHE_MAX_AGE_SECONDS: Final = 60 * 60
+USER_AGENT_SUFFIX: Final = "slaick/0.1"
+XDG_CACHE_DIRECTORY: Final = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+XDG_CONFIG_DIRECTORY: Final = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+CACHE_DIRECTORY: Final = XDG_CACHE_DIRECTORY / "slaick"
+TOKEN_CACHE_PATH: Final = CACHE_DIRECTORY / "user_token"
+CONFIG_DIRECTORY: Final = XDG_CONFIG_DIRECTORY / "slaick"
+WORKSPACE_CONFIG_PATH: Final = CONFIG_DIRECTORY / "workspace"
+SLACK_DIRECTORIES: Final = (
+    XDG_CONFIG_DIRECTORY / "Slack",
+    Path("~/.var/app/com.slack.Slack/config/Slack").expanduser(),
+)
+REFRESHABLE_AUTH_ERRORS: Final = {"invalid_auth", "token_revoked", "not_authed"}
+STALE_AUTH_ERRORS: Final = REFRESHABLE_AUTH_ERRORS | {"account_inactive"}
+CONVERSATION_TYPES: Final = "public_channel,private_channel,mpim,im"
+
+
+class SlaickError(click.ClickException):
+    """slaick command error."""
+
+
+class SlackCallError(SlaickError):
+    """Slack API call error."""
+
+    def __init__(self, method: str, error_code: str, status_code: int | None) -> None:
+        """Initialize the Slack API call error."""
+        self.error_code = error_code
+        if status_code:
+            message = f"Slack API {method} failed with HTTP {status_code}: {error_code}"
+        else:
+            message = f"Slack API {method} failed: {error_code}"
+        super().__init__(message)
+
+
+class SlaickContext:
+    """slaick command context."""
+
+    def __init__(self, workspace: str | None) -> None:
+        """Initialize the command context."""
+        self.workspace = workspace
+
+
+@dataclass
+class MessageFormatContext:
+    """Message formatting context."""
+
+    command_context: SlaickContext
+    user_display_names: dict[str, str]
+    conversation_names: dict[str, str]
+
+
+def normalize_workspace_url(workspace: str) -> str:
+    """Normalize a Slack workspace URL."""
+    if not (workspace := workspace.strip()):
+        raise SlaickError(
+            f"workspace is required (use --workspace or `slaick set-workspace`; config path: {WORKSPACE_CONFIG_PATH})",
+        )
+    if "://" not in workspace:
+        workspace = f"https://{workspace}/" if "." in workspace else f"https://{workspace}.slack.com/"
+    parsed_workspace = urllib.parse.urlparse(workspace)
+    if not parsed_workspace.scheme:
+        workspace = f"https://{workspace}"
+        parsed_workspace = urllib.parse.urlparse(workspace)
+    if not parsed_workspace.netloc:
+        raise SlaickError(f"invalid workspace URL: {workspace!r}")
+    path = parsed_workspace.path if parsed_workspace.path.endswith("/") else f"{parsed_workspace.path}/"
+    return urllib.parse.urlunparse((parsed_workspace.scheme, parsed_workspace.netloc, path or "/", "", "", ""))
+
+
+def find_cookies_database() -> Path:
+    """Find the Slack cookies database."""
+    for directory in SLACK_DIRECTORIES:
+        cookies_database = directory / "Cookies"
+        if cookies_database.is_file():
+            return cookies_database
+    raise SlaickError("could not find Slack Cookies database; is Slack installed and logged in?")
+
+
+def get_linux_secret_password(application: str) -> bytes | None:
+    """Read Chromium's Linux OSCrypt password from Secret Service."""
+    try:
+        with closing(secretstorage.dbus_init()) as connection:
+            collection = secretstorage.get_default_collection(connection)
+            collection.ensure_not_locked()
+            for item in collection.search_items({"application": application}):
+                secret = item.get_secret()
+                if secret:
+                    return secret
+    except (
+        secretstorage.SecretServiceNotAvailableException,
+        secretstorage.LockedException,
+        secretstorage.ItemNotFoundException,
+        secretstorage.PromptDismissedException,
+    ):
+        return None
+    return None
+
+
+def decrypt_aes_128_cbc(ciphertext: bytes, key: bytes, initialization_vector: bytes) -> bytes:
+    """Decrypt bytes with AES-128-CBC."""
+    try:
+        decryptor = Cipher(algorithms.AES(key), modes.CBC(initialization_vector)).decryptor()
+        padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        unpadder = padding.PKCS7(128).unpadder()
+        return unpadder.update(padded_plaintext) + unpadder.finalize()
+    except ValueError as error:
+        raise ValueError("bad decrypt") from error
+
+
+def decrypt_chromium_cookie(host_key: str, encrypted_value: bytes) -> str:
+    """Decrypt a Chromium cookie value."""
+    match encrypted_value[:3]:
+        case b"v10":
+            passwords = [b"peanuts"]
+        case b"v11":
+            passwords = []
+            if password := get_linux_secret_password("Slack"):
+                passwords.append(password)
+            passwords.append(b"")
+        case _:
+            raise SlaickError("cannot decrypt Slack cookie: unsupported encrypted cookie format")
+
+    for password in passwords:
+        key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1, 16)
+        try:
+            plaintext = decrypt_aes_128_cbc(encrypted_value[3:], key, b" " * 16)
+        except ValueError:
+            continue
+        host_digest = hashlib.sha256(host_key.encode("utf-8")).digest()
+        if plaintext.startswith(host_digest):
+            plaintext = plaintext[32:]
+        try:
+            return plaintext.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    raise SlaickError("cannot decrypt Slack d cookie from Chromium cookie store")
+
+
+def read_slack_session_cookie() -> str:
+    """Read Slack's session cookie."""
+    cookies_database = find_cookies_database()
+    try:
+        connection = sqlite3.connect(f"file:{cookies_database}?mode=ro", uri=True)
+    except sqlite3.Error as error:
+        raise SlaickError(f"failed to open {cookies_database}: {error}") from error
+
+    try:
+        row = connection.execute(
+            "SELECT host_key, value, encrypted_value FROM cookies WHERE host_key = '.slack.com' AND name = 'd' LIMIT 1",
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if "locked" in str(error).lower():
+            raise SlaickError(f"{cookies_database} is locked; quit Slack and retry") from error
+        raise SlaickError(f"failed to read {cookies_database}: {error}") from error
+    except sqlite3.Error as error:
+        raise SlaickError(f"failed to read {cookies_database}: {error}") from error
+    finally:
+        connection.close()
+
+    if not row:
+        raise SlaickError(f"d cookie not found in {cookies_database}")
+    host_key, value, encrypted_value = row
+    if value:
+        return cast("str", value)
+    if encrypted_value:
+        return decrypt_chromium_cookie(host_key, encrypted_value)
+    raise SlaickError(f"d cookie found in {cookies_database}, but both value and encrypted_value are empty")
+
+
+def fetch_session_token(cookie: str, workspace_url: str) -> str:
+    """Fetch a Slack session token."""
+    request = urllib.request.Request(workspace_url, headers={"Cookie": f"d={cookie}"})
+    try:
+        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as error:
+        raise SlaickError(f"failed to fetch Slack workspace page: {error}") from error
+
+    if not (match := SESSION_TOKEN_PATTERN.search(body)):
+        raise SlaickError(f"could not extract session token from {workspace_url}")
+    return match.group(0)
+
+
+def read_configured_workspace() -> str | None:
+    """Read the configured Slack workspace."""
+    try:
+        workspace = WORKSPACE_CONFIG_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SlaickError(f"failed to read workspace config {WORKSPACE_CONFIG_PATH}: {error}") from error
+    return workspace or None
+
+
+def get_workspace_url(command_context: SlaickContext) -> str:
+    """Get the active Slack workspace URL."""
+    workspace = command_context.workspace or read_configured_workspace()
+    return normalize_workspace_url(workspace or "")
+
+
+def get_workspace_cache_directory(command_context: SlaickContext) -> Path:
+    """Get the cache directory for the active workspace."""
+    workspace_url = get_workspace_url(command_context)
+    parsed_workspace = urllib.parse.urlparse(workspace_url)
+    workspace_name = f"{parsed_workspace.netloc}{parsed_workspace.path}".strip("/").lower()
+    safe_workspace_name = re.sub(r"[^a-z0-9._-]+", "_", workspace_name).strip("_")
+    workspace_hash = hashlib.sha256(workspace_url.encode("utf-8")).hexdigest()[:12]
+    return CACHE_DIRECTORY / f"{safe_workspace_name or 'workspace'}-{workspace_hash}"
+
+
+def ensure_workspace_cache_directory(command_context: SlaickContext) -> Path:
+    """Create the active workspace cache directory."""
+    CACHE_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    CACHE_DIRECTORY.chmod(0o700)
+    workspace_cache_directory = get_workspace_cache_directory(command_context)
+    workspace_cache_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    workspace_cache_directory.chmod(0o700)
+    return workspace_cache_directory
+
+
+def write_secret_text(path: Path, value: str, *, temporary_prefix: str) -> None:
+    """Write secret text atomically."""
+    if path == CACHE_DIRECTORY or CACHE_DIRECTORY in path.parents:
+        CACHE_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        CACHE_DIRECTORY.chmod(0o700)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    file_descriptor, temporary_path_name = tempfile.mkstemp(prefix=temporary_prefix, dir=path.parent, text=True)
+    temporary_path = Path(temporary_path_name)
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(value)
+            temporary_file.write("\n")
+        temporary_path.replace(path)
+        path.chmod(0o600)
+    except Exception:
+        with suppress(OSError):
+            temporary_path.unlink()
+        raise
+
+
+def write_configured_workspace(workspace_url: str) -> None:
+    """Write the configured Slack workspace."""
+    write_secret_text(WORKSPACE_CONFIG_PATH, workspace_url, temporary_prefix="workspace.")
+
+
+def read_cached_token() -> str | None:
+    """Read the cached Slack token."""
+    try:
+        token = TOKEN_CACHE_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SlaickError(f"failed to read token cache {TOKEN_CACHE_PATH}: {error}") from error
+    return token or None
+
+
+def write_cached_token(token: str) -> None:
+    """Write the cached Slack token."""
+    write_secret_text(TOKEN_CACHE_PATH, token, temporary_prefix="user_token.")
+
+
+def delete_cached_token() -> None:
+    """Delete the cached Slack token."""
+    try:
+        TOKEN_CACHE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise SlaickError(f"failed to remove token cache {TOKEN_CACHE_PATH}: {error}") from error
+
+
+def read_cached_user_id(command_context: SlaickContext) -> str | None:
+    """Read the cached Slack user ID."""
+    user_id_path = get_workspace_cache_directory(command_context) / "user_id"
+    try:
+        user_id = user_id_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SlaickError(f"failed to read user ID cache {user_id_path}: {error}") from error
+    return user_id or None
+
+
+def write_cached_user_id(command_context: SlaickContext, user_id: str) -> None:
+    """Write the cached Slack user ID."""
+    user_id_path = ensure_workspace_cache_directory(command_context) / "user_id"
+    write_secret_text(user_id_path, user_id, temporary_prefix="user_id.")
+
+
+def cache_user_id_from_authentication(command_context: SlaickContext, authentication: JsonObject) -> None:
+    """Cache the authenticated Slack user ID."""
+    if user_id := authentication.get("user_id"):
+        write_cached_user_id(command_context, str(user_id))
+
+
+def get_workspace_cache_database_path(command_context: SlaickContext) -> Path:
+    """Get the workspace cache database path."""
+    return ensure_workspace_cache_directory(command_context) / "workspace.sqlite3"
+
+
+def connect_workspace_cache(command_context: SlaickContext) -> sqlite3.Connection:
+    """Connect to the workspace cache database."""
+    database_path = get_workspace_cache_database_path(command_context)
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """,
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            username_fold TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            display_name_fold TEXT NOT NULL,
+            real_name TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            deleted INTEGER NOT NULL,
+            is_bot INTEGER NOT NULL
+        )
+        """,
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            channel_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        """,
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS users_username_fold_index ON users (username_fold)")
+    connection.execute("CREATE INDEX IF NOT EXISTS users_display_name_fold_index ON users (display_name_fold)")
+    database_path.chmod(0o600)
+    return connection
+
+
+def get_cache_updated_at(connection: sqlite3.Connection, key: str) -> int | None:
+    """Get a cache update timestamp."""
+    row = connection.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return None
+    try:
+        return int(row[0])
+    except ValueError:
+        return None
+
+
+def is_user_cache_stale(connection: sqlite3.Connection) -> bool:
+    """Check whether the user cache is stale."""
+    updated_at = get_cache_updated_at(connection, "users_updated_at")
+    return updated_at is None or int(time.time()) - updated_at >= USER_CACHE_MAX_AGE_SECONDS
+
+
+def is_conversation_cache_stale(connection: sqlite3.Connection) -> bool:
+    """Check whether the conversation cache is stale."""
+    updated_at = get_cache_updated_at(connection, "conversations_updated_at")
+    return updated_at is None or int(time.time()) - updated_at >= CONVERSATION_CACHE_MAX_AGE_SECONDS
+
+
+def get_all_slack_users(command_context: SlaickContext) -> list[JsonObject]:
+    """Fetch all Slack users."""
+    users: list[JsonObject] = []
+    cursor: str | None = None
+    while True:
+        result = call_with_refresh(command_context, "users_list", limit=200, cursor=cursor)
+        members = result.get("members", [])
+        users.extend(member for member in members if isinstance(member, dict))
+        response_metadata = result.get("response_metadata", {})
+        cursor = response_metadata.get("next_cursor") if isinstance(response_metadata, dict) else None
+        if not cursor:
+            break
+        time.sleep(0.2)
+    return users
+
+
+def refresh_user_cache(command_context: SlaickContext, connection: sqlite3.Connection) -> None:
+    """Refresh the user cache from Slack."""
+    users = get_all_slack_users(command_context)
+    with connection:
+        connection.execute("DELETE FROM users")
+        connection.executemany(
+            """
+            INSERT INTO users (
+                user_id,
+                username,
+                username_fold,
+                display_name,
+                display_name_fold,
+                real_name,
+                email,
+                deleted,
+                is_bot
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(user.get("id") or ""),
+                    str(user.get("name") or ""),
+                    str(user.get("name") or "").casefold(),
+                    get_user_display_name(user) or "",
+                    (get_user_display_name(user) or "").casefold(),
+                    slack_user_real_name(user),
+                    slack_user_email(user),
+                    1 if user.get("deleted") else 0,
+                    1 if user.get("is_bot") else 0,
+                )
+                for user in users
+                if user.get("id")
+            ],
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('users_updated_at', ?)",
+            (str(int(time.time())),),
+        )
+
+
+def ensure_user_cache(command_context: SlaickContext) -> sqlite3.Connection:
+    """Connect to a fresh-enough user cache."""
+    connection = connect_workspace_cache(command_context)
+    if is_user_cache_stale(connection):
+        refresh_user_cache(command_context, connection)
+    return connection
+
+
+def row_to_user(row: sqlite3.Row | tuple[Any, ...]) -> JsonObject:
+    """Convert a user cache row to a Slack-like user."""
+    return {
+        "id": row[0],
+        "name": row[1],
+        "real_name": row[5],
+        "deleted": bool(row[7]),
+        "is_bot": bool(row[8]),
+        "profile": {
+            "display_name": row[3],
+            "real_name": row[5],
+            "email": row[6],
+        },
+    }
+
+
+def get_all_slack_conversations(command_context: SlaickContext) -> list[JsonObject]:
+    """Fetch all Slack conversations."""
+    conversations: list[JsonObject] = []
+    cursor: str | None = None
+    while True:
+        result = call_with_refresh(
+            command_context,
+            "conversations_list",
+            types=CONVERSATION_TYPES,
+            exclude_archived=False,
+            limit=1000,
+            cursor=cursor,
+        )
+        conversations.extend(channel for channel in result.get("channels", []) if isinstance(channel, dict))
+        response_metadata = result.get("response_metadata", {})
+        cursor = response_metadata.get("next_cursor") if isinstance(response_metadata, dict) else None
+        if not cursor:
+            break
+        time.sleep(0.2)
+    return conversations
+
+
+def get_conversation_name(conversation: JsonObject) -> str:
+    """Get a displayable Slack conversation name."""
+    return str(conversation.get("name") or conversation.get("user") or conversation.get("id") or "unknown-channel")
+
+
+def refresh_conversation_cache(command_context: SlaickContext, connection: sqlite3.Connection) -> None:
+    """Refresh the conversation cache from Slack."""
+    conversations = get_all_slack_conversations(command_context)
+    with connection:
+        connection.execute("DELETE FROM conversations")
+        connection.executemany(
+            """
+            INSERT INTO conversations (channel_id, name)
+            VALUES (?, ?)
+            """,
+            [
+                (str(conversation.get("id")), get_conversation_name(conversation))
+                for conversation in conversations
+                if conversation.get("id")
+            ],
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('conversations_updated_at', ?)",
+            (str(int(time.time())),),
+        )
+
+
+def ensure_conversation_cache(command_context: SlaickContext) -> sqlite3.Connection:
+    """Connect to a fresh-enough conversation cache."""
+    connection = connect_workspace_cache(command_context)
+    if is_conversation_cache_stale(connection):
+        refresh_conversation_cache(command_context, connection)
+    return connection
+
+
+def load_conversation_names(command_context: SlaickContext) -> dict[str, str]:
+    """Load conversation names keyed by channel ID."""
+    with ensure_conversation_cache(command_context) as connection:
+        rows = connection.execute("SELECT channel_id, name FROM conversations").fetchall()
+    return {str(row[0]): str(row[1]) for row in rows}
+
+
+def write_conversation_name(command_context: SlaickContext, channel_id: str, channel_name: str) -> None:
+    """Write a conversation name to the cache."""
+    with connect_workspace_cache(command_context) as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO conversations (channel_id, name) VALUES (?, ?)",
+            (channel_id, channel_name),
+        )
+
+
+def fetch_user_display_name(command_context: SlaickContext, user_id: str) -> str | None:
+    """Fetch a displayable user name."""
+    result = call_with_refresh(command_context, "users_info", user=user_id)
+    user = result.get("user", {})
+    if isinstance(user, dict):
+        return get_user_display_name(user) or slack_user_real_name(user) or str(user.get("name") or user_id)
+    return None
+
+
+def fetch_uncached_conversation_name(command_context: SlaickContext, channel_id: str) -> str | None:
+    """Fetch an uncached conversation name."""
+    if is_user_id(channel_id):
+        return fetch_user_display_name(command_context, channel_id)
+
+    try:
+        result = call_with_refresh(command_context, "conversations_info", channel=channel_id)
+    except SlackCallError as error:
+        if error.error_code in {"channel_not_found", "not_in_channel", "invalid_arguments"}:
+            return None
+        raise
+    channel = result.get("channel", {})
+    if isinstance(channel, dict):
+        user_id = channel.get("user")
+        if channel.get("is_im") and user_id:
+            return fetch_user_display_name(command_context, str(user_id))
+        return get_conversation_name(channel)
+    return None
+
+
+def resolve_uncached_conversation_name(
+    command_context: SlaickContext,
+    channel_id: str,
+    conversation_names: dict[str, str],
+) -> str:
+    """Resolve and cache an uncached conversation name."""
+    if not channel_id:
+        return "unknown-channel"
+    if channel_name := fetch_uncached_conversation_name(command_context, channel_id):
+        conversation_names[channel_id] = channel_name
+        write_conversation_name(command_context, channel_id, channel_name)
+        return channel_name
+    return channel_id
+
+
+def is_unresolved_conversation_name(channel_id: str, channel_name: str | None) -> bool:
+    """Check whether a cached conversation name still looks unresolved."""
+    if not channel_name:
+        return True
+    return channel_name == channel_id or is_user_id(channel_name) or is_conversation_id(channel_name)
+
+
+def make_slack_client(token: str, cookie: str | None) -> WebClient:
+    """Create a Slack Web API client."""
+    headers = {"Cookie": f"d={cookie}"} if cookie else None
+    return WebClient(
+        token=token,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+        headers=headers,
+        user_agent_suffix=USER_AGENT_SUFFIX,
+    )
+
+
+def slack_response_to_dict(response: SlackResponse) -> JsonObject:
+    """Convert a Slack response to a dictionary."""
+    return cast("JsonObject", dict(response.data))
+
+
+def format_slack_api_error(error: SlackApiError, method: str) -> SlackCallError:
+    """Format a Slack API error."""
+    response = error.response
+    error_code = response.get("error", "unknown_error") if response is not None else "unknown_error"
+    status_code = getattr(response, "status_code", None)
+    return SlackCallError(method, str(error_code), status_code)
+
+
+def call_slack_api(client: WebClient, method: str, **parameters: Any) -> JsonObject:
+    """Call a Slack API method."""
+    try:
+        response = getattr(client, method)(**parameters)
+    except SlackApiError as error:
+        raise format_slack_api_error(error, method) from error
+    return slack_response_to_dict(response)
+
+
+def get_token(command_context: SlaickContext, *, force_refresh: bool = False) -> tuple[str, str | None]:
+    """Get a Slack token and session cookie."""
+    if not force_refresh and (token := read_cached_token()):
+        try:
+            cookie = read_slack_session_cookie()
+        except SlaickError:
+            cookie = None
+        return token, cookie
+
+    workspace_url = get_workspace_url(command_context)
+    cookie = read_slack_session_cookie()
+    token = fetch_session_token(cookie, workspace_url)
+    write_cached_token(token)
+    client = make_slack_client(token, cookie)
+    authentication = call_slack_api(client, "auth_test")
+    cache_user_id_from_authentication(command_context, authentication)
+    return token, cookie
+
+
+def get_slack_client(command_context: SlaickContext, *, force_refresh: bool = False) -> WebClient:
+    """Get a Slack Web API client."""
+    token, cookie = get_token(command_context, force_refresh=force_refresh)
+    return make_slack_client(token, cookie)
+
+
+def call_with_refresh(command_context: SlaickContext, method: str, **parameters: Any) -> JsonObject:
+    """Call Slack and refresh authentication if needed."""
+    client = get_slack_client(command_context)
+    try:
+        return call_slack_api(client, method, **parameters)
+    except SlackCallError as error:
+        if error.error_code not in REFRESHABLE_AUTH_ERRORS:
+            raise
+        delete_cached_token()
+        client = get_slack_client(command_context, force_refresh=True)
+        return call_slack_api(client, method, **parameters)
+
+
+def get_authenticated_user_id(command_context: SlaickContext) -> str:
+    """Get the authenticated Slack user ID."""
+    if user_id := read_cached_user_id(command_context):
+        return user_id
+    authentication = call_with_refresh(command_context, "auth_test")
+    cache_user_id_from_authentication(command_context, authentication)
+    if user_id := authentication.get("user_id"):
+        return str(user_id)
+    raise SlaickError("auth_test did not return user_id")
+
+
+def slack_user_handle(user: JsonObject) -> str:
+    """Format a Slack user handle."""
+    profile = user.get("profile", {})
+    display_name = profile.get("display_name") if isinstance(profile, dict) else None
+    name = user.get("name") or display_name or user.get("id") or "unknown"
+    return f"@{name}"
+
+
+def slack_user_real_name(user: JsonObject) -> str:
+    """Format a Slack user real name."""
+    profile = user.get("profile", {})
+    real_name = profile.get("real_name") or profile.get("display_name") if isinstance(profile, dict) else None
+    return str(user.get("real_name") or real_name or "")
+
+
+def slack_user_email(user: JsonObject) -> str:
+    """Get a Slack user email."""
+    profile = user.get("profile", {})
+    email = profile.get("email") if isinstance(profile, dict) else None
+    return str(email or "")
+
+
+def format_user(user: JsonObject) -> str:
+    """Format a Slack user as Markdown."""
+    details = [value for value in (slack_user_real_name(user), slack_user_email(user)) if value]
+    suffix = f": {', '.join(details)}" if details else ""
+    return f"{slack_user_handle(user)}{suffix}"
+
+
+def get_user_display_name(user: JsonObject) -> str | None:
+    """Get a Slack user display name."""
+    profile = user.get("profile", {})
+    if isinstance(profile, dict):
+        display_name = profile.get("display_name") or profile.get("real_name")
+        return str(display_name) if display_name else None
+    return None
+
+
+def is_user_id(value: str) -> bool:
+    """Check whether a value looks like a Slack user ID."""
+    return bool(re.fullmatch(r"[UW][A-Z0-9]+", value))
+
+
+def resolve_user_id(command_context: SlaickContext, user: str) -> str:
+    """Resolve a Slack user ID, username, or me."""
+    normalized_user = user.removeprefix("@")
+    if normalized_user == "me":
+        return get_authenticated_user_id(command_context)
+    if is_user_id(normalized_user):
+        return normalized_user
+
+    normalized_user_fold = normalized_user.casefold()
+    with ensure_user_cache(command_context) as connection:
+        exact_name_row = connection.execute(
+            """
+            SELECT user_id, username, username_fold, display_name, display_name_fold, real_name, email, deleted, is_bot
+            FROM users
+            WHERE deleted = 0 AND username_fold = ?
+            ORDER BY is_bot, username
+            LIMIT 1
+            """,
+            (normalized_user_fold,),
+        ).fetchone()
+        row = (
+            exact_name_row
+            or connection.execute(
+                """
+            SELECT user_id, username, username_fold, display_name, display_name_fold, real_name, email, deleted, is_bot
+            FROM users
+            WHERE deleted = 0 AND display_name_fold = ?
+            ORDER BY is_bot, username
+            LIMIT 1
+            """,
+                (normalized_user_fold,),
+            ).fetchone()
+        )
+    if not row:
+        raise SlaickError(f"user not found: {user}")
+    return str(row[0])
+
+
+def is_conversation_id(value: str) -> bool:
+    """Check whether a value looks like a Slack conversation ID."""
+    return bool(re.fullmatch(r"[CGD][A-Z0-9]+", value))
+
+
+def normalize_conversation_name(value: str) -> str:
+    """Normalize a Slack conversation name."""
+    return value.strip().removeprefix("#").casefold()
+
+
+def find_conversation_id_by_name(command_context: SlaickContext, name: str) -> str | None:
+    """Find a Slack conversation ID by name."""
+    normalized_name = normalize_conversation_name(name)
+    if not normalized_name:
+        return None
+
+    cursor: str | None = None
+    while True:
+        result = call_with_refresh(
+            command_context,
+            "conversations_list",
+            types=CONVERSATION_TYPES,
+            exclude_archived=False,
+            limit=1000,
+            cursor=cursor,
+        )
+        for channel in result.get("channels", []):
+            if not isinstance(channel, dict):
+                continue
+            channel_name = channel.get("name") or channel.get("user")
+            if channel_name and str(channel_name).casefold() == normalized_name:
+                channel_id = channel.get("id")
+                return str(channel_id) if channel_id else None
+        response_metadata = result.get("response_metadata", {})
+        cursor = response_metadata.get("next_cursor") if isinstance(response_metadata, dict) else None
+        if not cursor:
+            return None
+        time.sleep(0.2)
+
+
+def open_direct_message_channel(command_context: SlaickContext, user: str) -> str:
+    """Open a Slack direct message channel."""
+    user_id = resolve_user_id(command_context, user)
+    opened = call_with_refresh(command_context, "conversations_open", users=user_id)
+    channel = opened.get("channel", {})
+    channel_id = channel.get("id") if isinstance(channel, dict) else None
+    if not channel_id:
+        raise SlaickError("conversations_open did not return channel.id")
+    return str(channel_id)
+
+
+def resolve_conversation_id(command_context: SlaickContext, target: str) -> str:
+    """Resolve a Slack conversation target."""
+    normalized_target = target.strip()
+    if not normalized_target:
+        raise SlaickError("conversation target is required")
+    if is_conversation_id(normalized_target):
+        return normalized_target
+    if normalized_target.startswith("@"):
+        return open_direct_message_channel(command_context, normalized_target)
+    if channel_id := find_conversation_id_by_name(command_context, normalized_target):
+        return channel_id
+    return open_direct_message_channel(command_context, normalized_target)
+
+
+def resolve_send_target(command_context: SlaickContext, target: str) -> tuple[str, str, str]:
+    """Resolve a message send target."""
+    normalized_target = target.strip()
+    if not normalized_target:
+        raise SlaickError("send target is required")
+    if normalized_target.startswith("@"):
+        user_id = resolve_user_id(command_context, normalized_target)
+        return (
+            open_direct_message_channel(command_context, normalized_target),
+            fetch_user_display_name(command_context, user_id) or user_id,
+            "user",
+        )
+    channel_name = normalized_target.removeprefix("#")
+    if is_conversation_id(channel_name):
+        return channel_name, channel_name, "channel"
+    if channel_id := find_conversation_id_by_name(command_context, channel_name):
+        return channel_id, channel_name, "channel"
+    raise SlaickError(f"channel not found: {normalized_target}")
+
+
+def send_message(
+    command_context: SlaickContext,
+    target: str,
+    text: str,
+    thread_ts: str | None = None,
+) -> None:
+    """Send a Slack message."""
+    channel_id, target_name, target_type = resolve_send_target(command_context, target)
+    parameters: JsonObject = {"channel": channel_id, "text": text}
+    if thread_ts:
+        parameters["thread_ts"] = thread_ts
+    result = call_with_refresh(command_context, "chat_postMessage", **parameters)
+    message = result.get("message", {})
+    message_timestamp = message.get("ts") if isinstance(message, dict) else None
+    timestamp = result.get("ts") or message_timestamp
+    rendered_target = slack_handle(target_name) if target_type == "user" else f"#{target_name}"
+    click.echo(f"Sent message to {rendered_target} at {format_slack_timestamp(timestamp)}.")
+
+
+def load_user_display_names(command_context: SlaickContext) -> dict[str, str]:
+    """Load user display names keyed by user ID."""
+    with ensure_user_cache(command_context) as connection:
+        rows = connection.execute(
+            """
+            SELECT user_id, username, display_name, real_name
+            FROM users
+            """,
+        ).fetchall()
+    return {str(row[0]): str(row[2] or row[3] or row[1] or row[0]) for row in rows}
+
+
+def get_message_format_context(command_context: SlaickContext) -> MessageFormatContext:
+    """Get message formatting context."""
+    return MessageFormatContext(
+        command_context=command_context,
+        user_display_names=load_user_display_names(command_context),
+        conversation_names=load_conversation_names(command_context),
+    )
+
+
+def slack_handle(value: Any) -> str:
+    """Format a value as a Slack handle."""
+    text = str(value or "unknown")
+    return text if text.startswith("@") else f"@{text}"
+
+
+def get_message_sender(message: JsonObject, user_display_names: dict[str, str]) -> str:
+    """Get a displayable Slack message sender."""
+    if user_id := message.get("user"):
+        return slack_handle(user_display_names.get(str(user_id), str(user_id)))
+    if username := message.get("username"):
+        return slack_handle(username)
+    if bot_id := message.get("bot_id"):
+        return slack_handle(bot_id)
+    return slack_handle("unknown")
+
+
+def ordinal_day(value: int) -> str:
+    """Format a day with an ordinal suffix."""
+    if 11 <= value % 100 <= 13:
+        suffix = "th"
+    else:
+        match value % 10:
+            case 1:
+                suffix = "st"
+            case 2:
+                suffix = "nd"
+            case 3:
+                suffix = "rd"
+            case _:
+                suffix = "th"
+    return f"{value}{suffix}"
+
+
+def format_slack_timestamp(value: Any) -> str:
+    """Format a Slack timestamp in local time."""
+    try:
+        timestamp = float(str(value))
+    except ValueError:
+        return str(value or "unknown-time")
+    date_time = datetime.fromtimestamp(timestamp).astimezone()
+    hour = date_time.strftime("%I").lstrip("0") or "0"
+    return f"{date_time:%a %b} {ordinal_day(date_time.day)} {hour}:{date_time:%M%p}"
+
+
+def format_tail_message(message: JsonObject, format_context: MessageFormatContext) -> str | None:
+    """Format a Slack message for tail output."""
+    timestamp = message.get("ts")
+    text = clean_markdown_text(message.get("text"), format_context)
+    if not timestamp or not text:
+        return None
+    sender = get_message_sender(message, format_context.user_display_names)
+    return f"[{format_slack_timestamp(timestamp)}] {sender}: {text}"
+
+
+def output_tail_history(
+    command_context: SlaickContext,
+    channel_id: str,
+    line_count: int,
+    format_context: MessageFormatContext,
+) -> None:
+    """Print recent Slack conversation messages."""
+    if line_count == 0:
+        return
+    result = call_with_refresh(command_context, "conversations_history", channel=channel_id, limit=line_count)
+    messages = [message for message in result.get("messages", []) if isinstance(message, dict)]
+    for message in reversed(messages):
+        if line := format_tail_message(message, format_context):
+            click.echo(line)
+
+
+def get_real_time_messaging_websocket_url(command_context: SlaickContext) -> str:
+    """Get a Slack real-time messaging WebSocket URL."""
+    result = call_with_refresh(command_context, "rtm_connect")
+    url = result.get("url")
+    if not url:
+        raise SlaickError("rtm_connect did not return url")
+    return str(url)
+
+
+def should_print_tail_event(event: JsonObject, channel_id: str) -> bool:
+    """Check whether a Slack event belongs in tail output."""
+    return event.get("type") == "message" and event.get("channel") == channel_id
+
+
+def follow_tail_messages(command_context: SlaickContext, channel_id: str, format_context: MessageFormatContext) -> None:
+    """Follow new Slack conversation messages."""
+    while True:
+        websocket_url = get_real_time_messaging_websocket_url(command_context)
+        try:
+            cookie = read_slack_session_cookie()
+        except SlaickError:
+            cookie = None
+        headers = [f"Cookie: d={cookie}"] if cookie else None
+        websocket = create_connection(websocket_url, timeout=DEFAULT_TIMEOUT_SECONDS, header=headers)
+        try:
+            while True:
+                raw_message = websocket.recv()
+                if not isinstance(raw_message, str) or not raw_message.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or not should_print_tail_event(event, channel_id):
+                    continue
+                if line := format_tail_message(event, format_context):
+                    click.echo(line)
+                    sys.stdout.flush()
+        except KeyboardInterrupt:
+            return
+        except WebSocketTimeoutException:
+            continue
+        except WebSocketConnectionClosedException:
+            continue
+        finally:
+            websocket.close()
+
+
+def format_channel(channel: JsonObject) -> str:
+    """Format a Slack channel as Markdown."""
+    channel_id = channel.get("id") or "UNKNOWN_CHANNEL"
+    channel_name = channel.get("name") or channel.get("user") or channel_id
+    prefix = "#" if channel.get("is_channel") or channel.get("is_group") else ""
+    labels: list[str] = []
+    if channel.get("is_private"):
+        labels.append("private")
+    if channel.get("is_im"):
+        labels.append("direct message")
+    if channel.get("is_mpim"):
+        labels.append("multi-person direct message")
+    if channel.get("is_archived"):
+        labels.append("archived")
+    member_count = channel.get("num_members")
+    if isinstance(member_count, int):
+        labels.append(f"{member_count} members")
+    label_text = f" - {', '.join(labels)}" if labels else ""
+    return f"- {prefix}{channel_name}{label_text}"
+
+
+def resolve_message_user_reference(format_context: MessageFormatContext, user_id: str) -> str:
+    """Resolve a Slack message user reference."""
+    if user_name := format_context.user_display_names.get(user_id):
+        return slack_handle(user_name)
+    if user_name := fetch_user_display_name(format_context.command_context, user_id):
+        format_context.user_display_names[user_id] = user_name
+        return slack_handle(user_name)
+    return slack_handle(user_id)
+
+
+def resolve_message_channel_reference(format_context: MessageFormatContext, channel_id: str) -> str:
+    """Resolve a Slack message channel reference."""
+    if channel_name := format_context.conversation_names.get(channel_id):
+        return f"#{channel_name}"
+    channel_name = resolve_uncached_conversation_name(
+        format_context.command_context,
+        channel_id,
+        format_context.conversation_names,
+    )
+    return f"#{channel_name}"
+
+
+def format_slack_references(value: str, format_context: MessageFormatContext) -> str:
+    """Format Slack user and channel references."""
+    def replace_user(match: re.Match[str]) -> str:
+        return resolve_message_user_reference(format_context, match.group(1))
+
+    def replace_channel(match: re.Match[str]) -> str:
+        return resolve_message_channel_reference(format_context, match.group(1))
+
+    value = re.sub(r"<@([A-Z0-9]+)(?:\|[^>]+)?>", replace_user, value)
+    return re.sub(r"<#([A-Z0-9]+)(?:\|[^>]+)?>", replace_channel, value)
+
+
+def clean_markdown_text(value: Any, format_context: MessageFormatContext | None = None) -> str:
+    """Clean Slack text for compact Markdown output."""
+    text = str(value or "")
+    if format_context:
+        text = format_slack_references(text, format_context)
+    return " ".join(text.split())
+
+
+def get_search_channel_name(
+    command_context: SlaickContext,
+    match: JsonObject,
+    conversation_names: dict[str, str],
+) -> str:
+    """Get a displayable channel name for a search match."""
+    channel = match.get("channel", {})
+    if isinstance(channel, dict):
+        channel_id = str(channel.get("id") or "")
+        cached_name = conversation_names.get(channel_id)
+        if channel_id and is_unresolved_conversation_name(channel_id, cached_name):
+            return resolve_uncached_conversation_name(command_context, channel_id, conversation_names)
+        if cached_name:
+            return cached_name
+        channel_name = str(channel.get("name") or "")
+        if is_unresolved_conversation_name(channel_name, channel_name):
+            return resolve_uncached_conversation_name(command_context, channel_name, conversation_names)
+        return channel_name or "unknown-channel"
+    if isinstance(channel, str):
+        cached_name = conversation_names.get(channel)
+        if is_unresolved_conversation_name(channel, cached_name):
+            return resolve_uncached_conversation_name(command_context, channel, conversation_names)
+        return str(cached_name)
+    return "unknown-channel"
+
+
+def get_search_sender(match: JsonObject) -> str:
+    """Get a displayable search result sender."""
+    return slack_handle(match.get("username") or match.get("user_name") or match.get("user") or "unknown-user")
+
+
+def get_authenticated_user_display_name(command_context: SlaickContext) -> str:
+    """Get a displayable authenticated user name."""
+    user_id = get_authenticated_user_id(command_context)
+    return fetch_user_display_name(command_context, user_id) or user_id
+
+
+def get_search_context(
+    command_context: SlaickContext,
+    match: JsonObject,
+    conversation_names: dict[str, str],
+) -> str:
+    """Get a displayable search result context."""
+    sender = get_search_sender(match)
+    channel = match.get("channel", {})
+    if isinstance(channel, dict) and channel.get("is_im"):
+        user_id = str(channel.get("user") or channel.get("name") or "")
+        other_user = resolve_uncached_conversation_name(command_context, user_id, conversation_names)
+        if sender == slack_handle(other_user):
+            recipient = get_authenticated_user_display_name(command_context)
+        else:
+            recipient = other_user
+        return f"{sender} to {slack_handle(recipient)}"
+    channel_name = get_search_channel_name(command_context, match, conversation_names)
+    return f"#{channel_name} by {sender}"
+
+
+def format_search_match(format_context: MessageFormatContext, match: JsonObject) -> str:
+    """Format a Slack search match as Markdown."""
+    command_context = format_context.command_context
+    conversation_names = format_context.conversation_names
+    timestamp = format_slack_timestamp(match.get("ts"))
+    text = clean_markdown_text(match.get("text"), format_context)
+    heading = f"{get_search_context(command_context, match, conversation_names)} at {timestamp}:"
+    if text:
+        return f"{heading}\n > {text}"
+    return heading
+
+
+def output_lines(lines: list[str]) -> None:
+    """Print Markdown lines."""
+    click.echo("\n".join(lines))
+
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option(
+    "--workspace",
+    "-w",
+    help="Slack workspace URL or subdomain. Overrides the value from `slaick set-workspace` when fetching a new token.",
+)
+@click.pass_context
+def cli(click_context: click.Context, workspace: str | None) -> None:
+    """Small Slack CLI for AI models."""
+    click_context.obj = SlaickContext(workspace=workspace)
+
+
+@cli.command("user")
+@click.option("--me", is_flag=True, help="Return users.info for the authenticated user.")
+@click.option("--user", "user_id", help="Return users.info for this Slack user ID.")
+@click.pass_obj
+def command_user(command_context: SlaickContext, me: bool, user_id: str | None) -> None:
+    """Get authentication or user information."""
+    selected_user_id = user_id or get_authenticated_user_id(command_context)
+    result = call_with_refresh(command_context, "users_info", user=selected_user_id)
+    user = result.get("user", {})
+    if not isinstance(user, dict):
+        raise SlaickError("users_info did not return user")
+    if me or not user_id:
+        click.echo(format_user(user))
+    else:
+        click.echo(format_user(user))
+
+
+@cli.command("list-users")
+@click.option("--include-deleted", is_flag=True, help="Include deactivated users.")
+@click.option("--include-bots", is_flag=True, help="Include bot users.")
+@click.option("--limit", default=200, show_default=True, type=click.IntRange(1, 1000), help="Page size.")
+@click.pass_obj
+def command_list_users(command_context: SlaickContext, include_deleted: bool, include_bots: bool, limit: int) -> None:
+    """List Slack users."""
+    query = """
+        SELECT user_id, username, username_fold, display_name, display_name_fold, real_name, email, deleted, is_bot
+        FROM users
+        WHERE (? OR deleted = 0)
+        AND (? OR (is_bot = 0 AND user_id != 'USLACKBOT'))
+        ORDER BY username
+        LIMIT ?
+    """
+    with ensure_user_cache(command_context) as connection:
+        rows = connection.execute(query, (include_deleted, include_bots, limit)).fetchall()
+    users = [row_to_user(row) for row in rows]
+    if not users:
+        click.echo("_No users found._")
+        return
+    output_lines([f"Found {len(users)} users:", "", *[f"- {format_user(user)}" for user in users]])
+
+
+@cli.command("list-channels")
+@click.option(
+    "--types", default="public_channel,private_channel", show_default=True, help="Comma-separated conversation types."
+)
+@click.option("--include-archived", is_flag=True, help="Include archived conversations.")
+@click.option("--limit", default=200, show_default=True, type=click.IntRange(1, 1000), help="Page size.")
+@click.option("--all", "fetch_all", is_flag=True, help="List all conversations instead of only joined conversations.")
+@click.pass_obj
+def command_list_channels(
+    command_context: SlaickContext,
+    types: str,
+    include_archived: bool,
+    limit: int,
+    fetch_all: bool,
+) -> None:
+    """List Slack conversations."""
+    channels: list[JsonObject] = []
+    cursor: str | None = None
+    while True:
+        if fetch_all:
+            result = call_with_refresh(
+                command_context,
+                "conversations_list",
+                types=types,
+                exclude_archived=not include_archived,
+                limit=limit,
+                cursor=cursor,
+            )
+        else:
+            result = call_with_refresh(
+                command_context,
+                "users_conversations",
+                types=types,
+                exclude_archived=not include_archived,
+                limit=limit,
+                cursor=cursor,
+            )
+        channels.extend(channel for channel in result.get("channels", []) if isinstance(channel, dict))
+        response_metadata = result.get("response_metadata", {})
+        cursor = response_metadata.get("next_cursor") if isinstance(response_metadata, dict) else None
+        if not cursor:
+            break
+        time.sleep(0.2)
+
+    if not channels:
+        click.echo("_No channels found._")
+        return
+    output_lines([f"Found {len(channels)} channels:", "", *[format_channel(channel) for channel in channels]])
+
+
+@cli.command("search")
+@click.argument("query")
+@click.option("--count", default=20, show_default=True, type=click.IntRange(1), help="Results per page.")
+@click.option("--page", default=1, show_default=True, type=click.IntRange(1), help="Result page.")
+@click.option("--sort", type=click.Choice(("score", "timestamp")), default="timestamp", show_default=True)
+@click.option("--sort-dir", type=click.Choice(("asc", "desc")), default="desc", show_default=True)
+@click.pass_obj
+def command_search(
+    command_context: SlaickContext,
+    query: str,
+    count: int,
+    page: int,
+    sort: str,
+    sort_dir: str,
+) -> None:
+    """Search Slack messages."""
+    result = call_with_refresh(
+        command_context,
+        "search_messages",
+        query=query,
+        count=count,
+        page=page,
+        sort=sort,
+        sort_dir=sort_dir,
+    )
+    messages = result.get("messages", {})
+    matches = messages.get("matches", []) if isinstance(messages, dict) else []
+    if not matches:
+        click.echo("_No messages found._")
+        return
+    format_context = get_message_format_context(command_context)
+    formatted_matches = [format_search_match(format_context, match) for match in matches if isinstance(match, dict)]
+    output_lines([f"Found {len(formatted_matches)} messages:", "", *formatted_matches])
+
+
+@cli.command("tail")
+@click.argument("target")
+@click.option(
+    "--lines",
+    "line_count",
+    "-n",
+    default=10,
+    show_default=True,
+    type=click.IntRange(0),
+    help="Recent messages to print.",
+)
+@click.option("--follow", "follow", "-f", is_flag=True, help="Keep watching for new messages.")
+@click.pass_obj
+def command_tail(command_context: SlaickContext, target: str, line_count: int, follow: bool) -> None:
+    """Watch a Slack conversation."""
+    channel_id = resolve_conversation_id(command_context, target)
+    format_context = get_message_format_context(command_context)
+    output_tail_history(command_context, channel_id, line_count, format_context)
+    if follow:
+        follow_tail_messages(command_context, channel_id, format_context)
+
+
+@cli.command("send")
+@click.argument("target")
+@click.argument("text")
+@click.option("--thread-ts", help="Optional thread timestamp.")
+@click.pass_obj
+def command_send(command_context: SlaickContext, target: str, text: str, thread_ts: str | None) -> None:
+    """Send a message."""
+    send_message(command_context, target, text, thread_ts)
+
+
+@cli.command("dm")
+@click.argument("user")
+@click.argument("text")
+@click.option("--thread-ts", help="Optional thread timestamp.")
+@click.pass_obj
+def command_direct_message(command_context: SlaickContext, user: str, text: str, thread_ts: str | None) -> None:
+    """Send a direct message."""
+    send_message(command_context, f"@{user.removeprefix('@')}", text, thread_ts)
+
+
+@cli.command("logout")
+@click.pass_obj
+def command_logout(command_context: SlaickContext) -> None:
+    """Remove cached token."""
+    delete_cached_token()
+    click.echo(f"Deleted cached token: `{TOKEN_CACHE_PATH}`")
+
+
+@cli.command("clear-cache")
+@click.pass_obj
+def command_clear_cache(command_context: SlaickContext) -> None:
+    """Clear and rebuild workspace cache."""
+    workspace_cache_directory = get_workspace_cache_directory(command_context)
+    if workspace_cache_directory.exists():
+        shutil.rmtree(workspace_cache_directory)
+    authentication = call_with_refresh(command_context, "auth_test")
+    cache_user_id_from_authentication(command_context, authentication)
+    with ensure_user_cache(command_context):
+        pass
+    with ensure_conversation_cache(command_context):
+        pass
+    click.echo(f"Rebuilt workspace cache: `{workspace_cache_directory}`")
+
+
+@cli.command("set-workspace")
+@click.argument("workspace_value", metavar="workspace")
+@click.pass_obj
+def command_set_workspace(command_context: SlaickContext, workspace_value: str) -> None:
+    """Store default workspace."""
+    workspace_url = normalize_workspace_url(workspace_value)
+    write_configured_workspace(workspace_url)
+    delete_cached_token()
+    output_lines(
+        [
+            f"Workspace set to {workspace_url}",
+            f"Config: `{WORKSPACE_CONFIG_PATH}`",
+            "Cached token cleared.",
+        ],
+    )
+
+
+if __name__ == "__main__":
+    cli()

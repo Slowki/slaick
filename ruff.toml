@@ -1,0 +1,13 @@
+line-length = 120
+target-version = "py314"
+
+[format]
+docstring-code-format = true
+docstring-code-line-length = 120
+
+[lint]
+select = ["E", "SIM", "F", "W"]
+
+[lint.pydocstyle]
+convention = "google"
+
