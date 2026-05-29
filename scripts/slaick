@@ -1274,7 +1274,7 @@ def command_list_users(command_context: SlaickContext, include_deleted: bool, in
     if not users:
         click.echo("_No users found._")
         return
-    output_lines([f"Found {len(users)} users:", "", *[f"- {format_user(user)}" for user in users]])
+    output_lines([f"Found {len(users)} users:", "", *[f"- {format_user(user)} (ID: `{user['id']}`)" for user in users]])
 
 
 @cli.command("list-channels")
