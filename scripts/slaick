@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -53,6 +54,7 @@ TOKEN_CACHE_PATH: Final = CACHE_DIRECTORY / "user_token"
 CONFIG_DIRECTORY: Final = XDG_CONFIG_DIRECTORY / "slaick"
 WORKSPACE_CONFIG_PATH: Final = CONFIG_DIRECTORY / "workspace"
 SLACK_DIRECTORIES: Final = (
+    Path("~/Library/Application Support/Slack").expanduser(),
     XDG_CONFIG_DIRECTORY / "Slack",
     Path("~/.var/app/com.slack.Slack/config/Slack").expanduser(),
 )
@@ -142,6 +144,26 @@ def get_linux_secret_password(application: str) -> bytes | None:
     return None
 
 
+def get_macos_safe_storage_password(application: str) -> bytes | None:
+    """Read Chromium's macOS OSCrypt password from Keychain."""
+    if sys.platform != "darwin":
+        return None
+
+    for service in (f"{application} Safe Storage", application):
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-w", "-s", service],
+                capture_output=True,
+                check=False,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.rstrip(b"\r\n")
+    return None
+
+
 def decrypt_aes_128_cbc(ciphertext: bytes, key: bytes, initialization_vector: bytes) -> bytes:
     """Decrypt bytes with AES-128-CBC."""
     try:
@@ -157,17 +179,20 @@ def decrypt_chromium_cookie(host_key: str, encrypted_value: bytes) -> str:
     """Decrypt a Chromium cookie value."""
     match encrypted_value[:3]:
         case b"v10":
-            passwords = [b"peanuts"]
+            key_specs: list[tuple[bytes, int]] = []
+            if password := get_macos_safe_storage_password("Slack"):
+                key_specs.append((password, 1003))
+            key_specs.append((b"peanuts", 1))
         case b"v11":
-            passwords = []
+            key_specs = []
             if password := get_linux_secret_password("Slack"):
-                passwords.append(password)
-            passwords.append(b"")
+                key_specs.append((password, 1))
+            key_specs.append((b"", 1))
         case _:
             raise SlaickError("cannot decrypt Slack cookie: unsupported encrypted cookie format")
 
-    for password in passwords:
-        key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1, 16)
+    for password, iterations in key_specs:
+        key = hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", iterations, 16)
         try:
             plaintext = decrypt_aes_128_cbc(encrypted_value[3:], key, b" " * 16)
         except ValueError:
