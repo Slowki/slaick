@@ -129,6 +129,12 @@ scripts/slaick tail --follow @alice
 scripts/slaick tail --follow --lines 20 general
 ```
 
+Tail output includes shared files as `[file F123...: filename]`. Download a shared file to stdout with:
+
+```bash
+scripts/slaick cat-file F1234567890 > filename
+```
+
 Use `tail --follow` when the user asks to wait for Slack replies. It defaults
 to `--lines 0`, so it only prints new messages. Add `--lines <count>` only
 when recent history is useful. Start the command in a long-running terminal

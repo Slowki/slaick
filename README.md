@@ -48,6 +48,9 @@ slaick list-channels --types public_channel,private_channel,im,mpim --all
 # Search messages
 slaick search 'from:@alice budget after:2026-01-01'
 
+# Download a file shown by tail as [file F123...: name]
+slaick cat-file F1234567890 > shared-file.bin
+
 # Send a message to a channel
 slaick send lobsters-r-us 'hello from slaick'
 printf 'hello from stdin' | slaick send lobsters-r-us
