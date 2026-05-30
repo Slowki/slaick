@@ -106,20 +106,28 @@ the message body is optional and becomes the upload comment.
 Reply in a thread when the thread timestamp is known:
 
 ```bash
-scripts/slaick send general 'reply text' --thread-ts 1716153058.123456
-scripts/slaick dm alice 'reply text' --thread-ts 1716153058.123456
+scripts/slaick send general 'reply text' --thread 1716153058.123456
+scripts/slaick dm alice 'reply text' --thread 1716153058.123456
 ```
+
+`--thread-ts` is also accepted as an alias for `--thread`.
 
 Treat Slack writes as live side effects. Only send messages when the user has
 asked for that action and clearly approved the exact content.
 
 ## Tail and Wait for Responses
 
-Print recent messages from a channel or direct message:
+Print recent messages from a channel or direct message. Threaded messages include `[thread THREAD_TS]`:
 
 ```bash
 scripts/slaick tail --lines 20 general
 scripts/slaick tail @alice
+```
+
+Print a thread by the thread timestamp shown in tail output:
+
+```bash
+scripts/slaick tail @alice --thread 1780103312.121629
 ```
 
 Watch a conversation for new messages:
@@ -127,6 +135,7 @@ Watch a conversation for new messages:
 ```bash
 scripts/slaick tail --follow @alice
 scripts/slaick tail --follow --lines 20 general
+scripts/slaick tail --follow @alice --thread 1780103312.121629
 ```
 
 Tail output includes shared files as `[file F123...: filename]`. Download a shared file to stdout with:

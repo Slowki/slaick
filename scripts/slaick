@@ -894,6 +894,11 @@ def render_send_target(target_name: str, target_type: str) -> str:
     return slack_handle(target_name) if target_type == "user" else f"#{target_name}"
 
 
+def render_send_destination(rendered_target: str, thread_ts: str | None) -> str:
+    """Render a send destination, including a thread when provided."""
+    return f"{rendered_target} thread {thread_ts}" if thread_ts else rendered_target
+
+
 def send_message(
     command_context: SlaickContext,
     target: str,
@@ -904,6 +909,7 @@ def send_message(
     """Send a Slack message or file upload."""
     channel_id, target_name, target_type = resolve_send_target(command_context, target)
     rendered_target = render_send_target(target_name, target_type)
+    rendered_destination = render_send_destination(rendered_target, thread_ts)
     if file_paths:
         file_uploads = [
             {"file": str(file_path), "filename": file_path.name, "title": file_path.name}
@@ -916,7 +922,7 @@ def send_message(
             parameters["thread_ts"] = thread_ts
         call_with_refresh(command_context, "files_upload_v2", **parameters)
         suffix = "" if len(file_paths) == 1 else "s"
-        click.echo(f"Uploaded {len(file_paths)} file{suffix} to {rendered_target}.")
+        click.echo(f"Uploaded {len(file_paths)} file{suffix} to {rendered_destination}.")
         return
 
     if text is None:
@@ -928,7 +934,7 @@ def send_message(
     message = result.get("message", {})
     message_timestamp = message.get("ts") if isinstance(message, dict) else None
     timestamp = result.get("ts") or message_timestamp
-    click.echo(f"Sent message to {rendered_target} at {format_slack_timestamp(timestamp)}.")
+    click.echo(f"Sent message to {rendered_destination} at {format_slack_timestamp(timestamp)}.")
 
 
 def get_message_text(text: str | None, *, require_text: bool) -> str | None:
@@ -1059,6 +1065,17 @@ def format_tail_file(file: JsonObject) -> str:
     return f"[file {file_id}: {file_name}{detail_text}]"
 
 
+def get_message_thread_id(message: JsonObject) -> str | None:
+    """Get the thread ID for a message that starts or belongs to a thread."""
+    thread_ts = message.get("thread_ts")
+    if thread_ts:
+        return str(thread_ts)
+    if message.get("reply_count"):
+        timestamp = message.get("ts")
+        return str(timestamp) if timestamp else None
+    return None
+
+
 def format_tail_message(message: JsonObject, format_context: MessageFormatContext) -> str | None:
     """Format a Slack message for tail output."""
     timestamp = message.get("ts")
@@ -1070,7 +1087,30 @@ def format_tail_message(message: JsonObject, format_context: MessageFormatContex
     if not parts:
         return None
     sender = get_message_sender(message, format_context.user_display_names)
-    return f"[{format_slack_timestamp(timestamp)}] {sender}: {' '.join(parts)}"
+    thread_id = get_message_thread_id(message)
+    thread_text = f" [thread {thread_id}]" if thread_id else ""
+    return f"[{format_slack_timestamp(timestamp)}] {sender}{thread_text}: {' '.join(parts)}"
+
+
+def fetch_thread_messages(command_context: SlaickContext, channel_id: str, thread_ts: str) -> list[JsonObject]:
+    """Fetch all visible messages in a Slack thread."""
+    messages: list[JsonObject] = []
+    cursor: str | None = None
+    while True:
+        result = call_with_refresh(
+            command_context,
+            "conversations_replies",
+            channel=channel_id,
+            ts=thread_ts,
+            limit=1000,
+            cursor=cursor,
+        )
+        messages.extend(message for message in result.get("messages", []) if isinstance(message, dict))
+        response_metadata = result.get("response_metadata", {})
+        cursor = response_metadata.get("next_cursor") if isinstance(response_metadata, dict) else None
+        if not cursor:
+            return messages
+        time.sleep(0.2)
 
 
 def output_tail_history(
@@ -1078,13 +1118,17 @@ def output_tail_history(
     channel_id: str,
     line_count: int,
     format_context: MessageFormatContext,
+    thread_ts: str | None = None,
 ) -> None:
-    """Print recent Slack conversation messages."""
+    """Print recent Slack conversation or thread messages."""
     if line_count == 0:
         return
-    result = call_with_refresh(command_context, "conversations_history", channel=channel_id, limit=line_count)
-    messages = [message for message in result.get("messages", []) if isinstance(message, dict)]
-    for message in reversed(messages):
+    if thread_ts:
+        messages = fetch_thread_messages(command_context, channel_id, thread_ts)[-line_count:]
+    else:
+        result = call_with_refresh(command_context, "conversations_history", channel=channel_id, limit=line_count)
+        messages = list(reversed([message for message in result.get("messages", []) if isinstance(message, dict)]))
+    for message in messages:
         if line := format_tail_message(message, format_context):
             click.echo(line)
 
@@ -1098,13 +1142,20 @@ def get_real_time_messaging_websocket_url(command_context: SlaickContext) -> str
     return str(url)
 
 
-def should_print_tail_event(event: JsonObject, channel_id: str) -> bool:
+def should_print_tail_event(event: JsonObject, channel_id: str, thread_ts: str | None = None) -> bool:
     """Check whether a Slack event belongs in tail output."""
-    return event.get("type") == "message" and event.get("channel") == channel_id
+    if event.get("type") != "message" or event.get("channel") != channel_id:
+        return False
+    return not thread_ts or event.get("thread_ts") == thread_ts
 
 
-def follow_tail_messages(command_context: SlaickContext, channel_id: str, format_context: MessageFormatContext) -> None:
-    """Follow new Slack conversation messages."""
+def follow_tail_messages(
+    command_context: SlaickContext,
+    channel_id: str,
+    format_context: MessageFormatContext,
+    thread_ts: str | None = None,
+) -> None:
+    """Follow new Slack conversation or thread messages."""
     while True:
         websocket_url = get_real_time_messaging_websocket_url(command_context)
         try:
@@ -1122,7 +1173,7 @@ def follow_tail_messages(command_context: SlaickContext, channel_id: str, format
                     event = json.loads(raw_message)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(event, dict) or not should_print_tail_event(event, channel_id):
+                if not isinstance(event, dict) or not should_print_tail_event(event, channel_id, thread_ts):
                     continue
                 if line := format_tail_message(event, format_context):
                     click.echo(line)
@@ -1474,17 +1525,29 @@ def command_search(
     type=click.IntRange(0),
     help="Recent messages to print.",
 )
+@click.option(
+    "--thread",
+    "--thread-ts",
+    "thread_ts",
+    help="Tail this thread timestamp instead of the whole conversation.",
+)
 @click.option("--follow", "follow", "-f", is_flag=True, help="Keep watching for new messages.")
 @click.pass_obj
-def command_tail(command_context: SlaickContext, target: str, line_count: int | None, follow: bool) -> None:
-    """Watch a Slack conversation."""
+def command_tail(
+    command_context: SlaickContext,
+    target: str,
+    line_count: int | None,
+    thread_ts: str | None,
+    follow: bool,
+) -> None:
+    """Watch a Slack conversation or thread."""
     if line_count is None:
         line_count = 0 if follow else 10
     channel_id = resolve_conversation_id(command_context, target)
     format_context = get_message_format_context(command_context)
-    output_tail_history(command_context, channel_id, line_count, format_context)
+    output_tail_history(command_context, channel_id, line_count, format_context, thread_ts)
     if follow:
-        follow_tail_messages(command_context, channel_id, format_context)
+        follow_tail_messages(command_context, channel_id, format_context, thread_ts)
 
 
 @cli.command("send")
@@ -1497,7 +1560,7 @@ def command_tail(command_context: SlaickContext, target: str, line_count: int | 
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="File path to upload. May be used more than once.",
 )
-@click.option("--thread-ts", help="Optional thread timestamp.")
+@click.option("--thread", "--thread-ts", "thread_ts", help="Optional thread timestamp.")
 @click.pass_obj
 def command_send(
     command_context: SlaickContext,
@@ -1529,7 +1592,7 @@ def command_cat_file(command_context: SlaickContext, file_id: str) -> None:
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="File path to upload. May be used more than once.",
 )
-@click.option("--thread-ts", help="Optional thread timestamp.")
+@click.option("--thread", "--thread-ts", "thread_ts", help="Optional thread timestamp.")
 @click.pass_obj
 def command_direct_message(
     command_context: SlaickContext,
