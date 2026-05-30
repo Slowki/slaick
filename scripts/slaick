@@ -899,6 +899,65 @@ def render_send_destination(rendered_target: str, thread_ts: str | None) -> str:
     return f"{rendered_target} thread {thread_ts}" if thread_ts else rendered_target
 
 
+def normalize_reaction_name(value: str) -> str:
+    """Normalize an emoji reaction name for Slack's reactions.add API."""
+    reaction_name = value.strip().removeprefix(":").removesuffix(":")
+    if not reaction_name:
+        raise SlaickError("reaction emoji is required")
+    return reaction_name
+
+
+def normalize_message_timestamp(value: str) -> str:
+    """Normalize Slack message timestamp formats."""
+    timestamp = value.strip()
+    if not timestamp:
+        raise SlaickError("message timestamp is required")
+    if re.fullmatch(r"\d+\.\d+", timestamp):
+        return timestamp
+    if match := re.fullmatch(r"p?(\d{10})(\d{6})", timestamp):
+        return f"{match.group(1)}.{match.group(2)}"
+    raise SlaickError(f"invalid Slack message timestamp: {value!r}")
+
+
+def parse_slack_message_permalink(value: str) -> tuple[str, str] | None:
+    """Parse a Slack message permalink into channel ID and timestamp."""
+    parsed_url = urllib.parse.urlparse(value)
+    if not parsed_url.scheme or not parsed_url.netloc:
+        return None
+    path_parts = [urllib.parse.unquote(part) for part in parsed_url.path.split("/") if part]
+    if len(path_parts) < 3 or path_parts[-3] != "archives":
+        return None
+    channel_id = path_parts[-2]
+    if not is_conversation_id(channel_id):
+        return None
+    return channel_id, normalize_message_timestamp(path_parts[-1])
+
+
+def resolve_reaction_target(
+    command_context: SlaickContext,
+    target_or_url: str,
+    timestamp_or_emoji: str,
+    emoji: str | None,
+) -> tuple[str, str, str]:
+    """Resolve reaction command arguments to channel, timestamp, and emoji."""
+    if emoji is None:
+        if not (message_reference := parse_slack_message_permalink(target_or_url)):
+            raise SlaickError("emoji is required unless the message is specified with a Slack permalink")
+        channel_id, timestamp = message_reference
+        reaction_name = normalize_reaction_name(timestamp_or_emoji)
+    else:
+        channel_id = resolve_conversation_id(command_context, target_or_url)
+        timestamp = normalize_message_timestamp(timestamp_or_emoji)
+        reaction_name = normalize_reaction_name(emoji)
+    return channel_id, timestamp, reaction_name
+
+
+def add_reaction(command_context: SlaickContext, channel_id: str, timestamp: str, reaction_name: str) -> None:
+    """Add an emoji reaction to a Slack message."""
+    call_with_refresh(command_context, "reactions_add", channel=channel_id, timestamp=timestamp, name=reaction_name)
+    click.echo(f"Added :{reaction_name}: reaction to {channel_id} at {timestamp}.")
+
+
 def send_message(
     command_context: SlaickContext,
     target: str,
@@ -1087,9 +1146,8 @@ def format_tail_message(message: JsonObject, format_context: MessageFormatContex
     if not parts:
         return None
     sender = get_message_sender(message, format_context.user_display_names)
-    thread_id = get_message_thread_id(message)
-    thread_text = f" [thread {thread_id}]" if thread_id else ""
-    return f"[{format_slack_timestamp(timestamp)}] {sender}{thread_text}: {' '.join(parts)}"
+    thread_text = " | thread" if get_message_thread_id(message) else ""
+    return f"[{format_slack_timestamp(timestamp)} | ts {timestamp}{thread_text}] {sender}: {' '.join(parts)}"
 
 
 def fetch_thread_messages(command_context: SlaickContext, channel_id: str, thread_ts: str) -> list[JsonObject]:
@@ -1548,6 +1606,27 @@ def command_tail(
     output_tail_history(command_context, channel_id, line_count, format_context, thread_ts)
     if follow:
         follow_tail_messages(command_context, channel_id, format_context, thread_ts)
+
+
+@cli.command("react")
+@click.argument("target_or_url")
+@click.argument("timestamp_or_emoji")
+@click.argument("emoji", required=False)
+@click.pass_obj
+def command_react(
+    command_context: SlaickContext,
+    target_or_url: str,
+    timestamp_or_emoji: str,
+    emoji: str | None,
+) -> None:
+    """Add an emoji reaction to a Slack message."""
+    channel_id, timestamp, reaction_name = resolve_reaction_target(
+        command_context,
+        target_or_url,
+        timestamp_or_emoji,
+        emoji,
+    )
+    add_reaction(command_context, channel_id, timestamp, reaction_name)
 
 
 @cli.command("send")

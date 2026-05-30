@@ -76,7 +76,7 @@ slaick tail -f general
 # Follow after printing recent messages
 slaick tail -n 20 -f general
 
-# Print recent direct messages. Threaded messages show [thread THREAD_TS].
+# Print recent direct messages. Lines show message ts; threaded messages show `| thread`.
 slaick tail @alice
 
 # Print or follow a thread by thread timestamp
@@ -86,6 +86,9 @@ slaick tail -f @alice --thread 1780103312.121629
 # Post to a thread
 slaick send @alice 'reply in thread' --thread 1780103312.121629
 slaick dm alice 'reply in thread' --thread 1780103312.121629
+
+# Add an emoji reaction to a message
+slaick react @alice 1780103312.121629 white_check_mark
 
 # Forget cached token
 slaick logout

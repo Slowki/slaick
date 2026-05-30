@@ -112,12 +112,19 @@ scripts/slaick dm alice 'reply text' --thread 1716153058.123456
 
 `--thread-ts` is also accepted as an alias for `--thread`.
 
-Treat Slack writes as live side effects. Only send messages when the user has
+Add an emoji reaction to a message when the message timestamp is known:
+
+```bash
+scripts/slaick react general 1716153058.123456 white_check_mark
+scripts/slaick react @alice 1716153058.123456 :eyes:
+```
+
+Treat Slack writes as live side effects. Only send messages or add reactions when the user has
 asked for that action and clearly approved the exact content.
 
 ## Tail and Wait for Responses
 
-Print recent messages from a channel or direct message. Threaded messages include `[thread THREAD_TS]`:
+Print recent messages from a channel or direct message. Each line includes the message timestamp as `ts MESSAGE_TS`; threaded messages include `| thread` in the timestamp bracket:
 
 ```bash
 scripts/slaick tail --lines 20 general
