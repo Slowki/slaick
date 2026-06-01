@@ -958,6 +958,12 @@ def add_reaction(command_context: SlaickContext, channel_id: str, timestamp: str
     click.echo(f"Added :{reaction_name}: reaction to {channel_id} at {timestamp}.")
 
 
+def edit_message(command_context: SlaickContext, channel_id: str, timestamp: str, text: str) -> None:
+    """Edit a Slack message."""
+    call_with_refresh(command_context, "chat_update", channel=channel_id, ts=timestamp, text=text)
+    click.echo(f"Edited message in {channel_id} at {format_slack_timestamp(timestamp)}.")
+
+
 def send_message(
     command_context: SlaickContext,
     target: str,
@@ -996,13 +1002,16 @@ def send_message(
     click.echo(f"Sent message to {rendered_destination} at {format_slack_timestamp(timestamp)}.")
 
 
-def get_message_text(text: str | None, *, require_text: bool) -> str | None:
+def get_message_text(text: str | None, *, require_text: bool, file_option_available: bool = False) -> str | None:
     """Read message text from an argument or standard input."""
     if text is not None:
         return text
     if sys.stdin.isatty():
         if require_text:
-            raise SlaickError("message text is required unless provided on stdin or --file is provided")
+            hint = "unless provided on stdin"
+            if file_option_available:
+                hint = f"{hint} or --file is provided"
+            raise SlaickError(f"message text is required {hint}")
         return None
     standard_input_text = sys.stdin.read().rstrip("\n")
     if not standard_input_text:
@@ -1629,6 +1638,34 @@ def command_react(
     add_reaction(command_context, channel_id, timestamp, reaction_name)
 
 
+@cli.command("edit")
+@click.argument("target_or_url")
+@click.argument("timestamp_or_text", required=False)
+@click.argument("text", required=False)
+@click.pass_obj
+def command_edit(
+    command_context: SlaickContext,
+    target_or_url: str,
+    timestamp_or_text: str | None,
+    text: str | None,
+) -> None:
+    """Edit a Slack message."""
+    if message_reference := parse_slack_message_permalink(target_or_url):
+        if text is not None:
+            raise SlaickError("timestamp is not needed when the message is specified with a Slack permalink")
+        channel_id, timestamp = message_reference
+        message_text = get_message_text(timestamp_or_text, require_text=True)
+    else:
+        if timestamp_or_text is None:
+            raise SlaickError("message timestamp is required unless the message is specified with a Slack permalink")
+        channel_id = resolve_conversation_id(command_context, target_or_url)
+        timestamp = normalize_message_timestamp(timestamp_or_text)
+        message_text = get_message_text(text, require_text=True)
+    if message_text is None:
+        raise SlaickError("message text is required")
+    edit_message(command_context, channel_id, timestamp, message_text)
+
+
 @cli.command("send")
 @click.argument("target")
 @click.argument("text", required=False)
@@ -1649,7 +1686,7 @@ def command_send(
     thread_ts: str | None,
 ) -> None:
     """Send a message."""
-    message_text = get_message_text(text, require_text=not file_paths)
+    message_text = get_message_text(text, require_text=not file_paths, file_option_available=True)
     send_message(command_context, target, message_text, thread_ts, file_paths)
 
 
@@ -1681,7 +1718,7 @@ def command_direct_message(
     thread_ts: str | None,
 ) -> None:
     """Send a direct message."""
-    message_text = get_message_text(text, require_text=not file_paths)
+    message_text = get_message_text(text, require_text=not file_paths, file_option_available=True)
     send_message(command_context, f"@{user.removeprefix('@')}", message_text, thread_ts, file_paths)
 
 

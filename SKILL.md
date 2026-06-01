@@ -119,7 +119,15 @@ scripts/slaick react general 1716153058.123456 white_check_mark
 scripts/slaick react @alice 1716153058.123456 :eyes:
 ```
 
-Treat Slack writes as live side effects. Only send messages or add reactions when the user has
+Edit a message when the message timestamp is known:
+
+```bash
+scripts/slaick edit general 1716153058.123456 'corrected text'
+printf 'corrected text from stdin' | scripts/slaick edit @alice 1716153058.123456
+scripts/slaick edit 'https://workspace.slack.com/archives/C123/p1716153058123456' 'corrected text'
+```
+
+Treat Slack writes as live side effects. Only send messages, edit messages, or add reactions when the user has
 asked for that action and clearly approved the exact content.
 
 ## Tail and Wait for Responses

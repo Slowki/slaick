@@ -90,6 +90,13 @@ slaick dm alice 'reply in thread' --thread 1780103312.121629
 # Add an emoji reaction to a message
 slaick react @alice 1780103312.121629 white_check_mark
 
+# Edit a message by channel/DM and timestamp
+slaick edit @alice 1780103312.121629 'corrected text'
+printf 'corrected text from stdin' | slaick edit general 1780103312.121629
+
+# Edit a message by Slack permalink
+slaick edit 'https://workspace.slack.com/archives/C123/p1780103312121629' 'corrected text'
+
 # Forget cached token
 slaick logout
 
