@@ -10,7 +10,7 @@
 #   "websocket-client",
 # ]
 # ///
-"""slaick: a small Slack CLI for AI agents."""
+"""slack-tool: a small Slack CLI for AI agents."""
 
 from contextlib import closing, suppress
 from datetime import datetime
@@ -46,12 +46,14 @@ SESSION_TOKEN_PATTERN: Final = re.compile(r'xoxc-[^"]+')
 DEFAULT_TIMEOUT_SECONDS: Final = 30
 USER_CACHE_MAX_AGE_SECONDS: Final = 7 * 24 * 60 * 60
 CONVERSATION_CACHE_MAX_AGE_SECONDS: Final = 60 * 60
-USER_AGENT_SUFFIX: Final = "slaick/0.1"
+USER_AGENT_SUFFIX: Final = "slack-tool/0.1"
 XDG_CACHE_DIRECTORY: Final = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
 XDG_CONFIG_DIRECTORY: Final = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
-CACHE_DIRECTORY: Final = XDG_CACHE_DIRECTORY / "slaick"
+SKILLS_NAMESPACE: Final = "steph-skills"
+SKILL_NAME: Final = "use-slack"
+CACHE_DIRECTORY: Final = XDG_CACHE_DIRECTORY / SKILLS_NAMESPACE / SKILL_NAME
 TOKEN_CACHE_PATH: Final = CACHE_DIRECTORY / "user_token"
-CONFIG_DIRECTORY: Final = XDG_CONFIG_DIRECTORY / "slaick"
+CONFIG_DIRECTORY: Final = XDG_CONFIG_DIRECTORY / SKILLS_NAMESPACE / SKILL_NAME
 WORKSPACE_CONFIG_PATH: Final = CONFIG_DIRECTORY / "workspace"
 SLACK_DIRECTORIES: Final = (
     Path("~/Library/Application Support/Slack").expanduser(),
@@ -64,7 +66,7 @@ CONVERSATION_TYPES: Final = "public_channel,private_channel,mpim,im"
 
 
 class SlaickError(click.ClickException):
-    """slaick command error."""
+    """slack-tool command error."""
 
 
 class SlackCallError(SlaickError):
@@ -81,7 +83,7 @@ class SlackCallError(SlaickError):
 
 
 class SlaickContext:
-    """slaick command context."""
+    """slack-tool command context."""
 
     def __init__(self, workspace: str | None) -> None:
         """Initialize the command context."""
@@ -101,7 +103,8 @@ def normalize_workspace_url(workspace: str) -> str:
     """Normalize a Slack workspace URL."""
     if not (workspace := workspace.strip()):
         raise SlaickError(
-            f"workspace is required (use --workspace or `slaick set-workspace`; config path: {WORKSPACE_CONFIG_PATH})",
+            "workspace is required (use --workspace or `slack-tool.py set-workspace`; "
+            f"config path: {WORKSPACE_CONFIG_PATH})",
         )
     if "://" not in workspace:
         workspace = f"https://{workspace}/" if "." in workspace else f"https://{workspace}.slack.com/"
@@ -157,7 +160,7 @@ def get_macos_safe_storage_password(application: str) -> bytes | None:
                 check=False,
                 timeout=DEFAULT_TIMEOUT_SECONDS,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError, subprocess.TimeoutExpired:
             continue
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.rstrip(b"\r\n")
@@ -279,10 +282,18 @@ def get_workspace_cache_directory(command_context: SlaickContext) -> Path:
     return CACHE_DIRECTORY / f"{safe_workspace_name or 'workspace'}-{workspace_hash}"
 
 
+def ensure_skill_directory(path: Path) -> Path:
+    """Create a skill data directory under the shared XDG namespace."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+    if path.parent.name == SKILLS_NAMESPACE:
+        path.parent.chmod(0o700)
+    return path
+
+
 def ensure_workspace_cache_directory(command_context: SlaickContext) -> Path:
     """Create the active workspace cache directory."""
-    CACHE_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
-    CACHE_DIRECTORY.chmod(0o700)
+    ensure_skill_directory(CACHE_DIRECTORY)
     workspace_cache_directory = get_workspace_cache_directory(command_context)
     workspace_cache_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     workspace_cache_directory.chmod(0o700)
@@ -292,8 +303,9 @@ def ensure_workspace_cache_directory(command_context: SlaickContext) -> Path:
 def write_secret_text(path: Path, value: str, *, temporary_prefix: str) -> None:
     """Write secret text atomically."""
     if path == CACHE_DIRECTORY or CACHE_DIRECTORY in path.parents:
-        CACHE_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
-        CACHE_DIRECTORY.chmod(0o700)
+        ensure_skill_directory(CACHE_DIRECTORY)
+    elif path == CONFIG_DIRECTORY or CONFIG_DIRECTORY in path.parents:
+        ensure_skill_directory(CONFIG_DIRECTORY)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.parent.chmod(0o700)
     file_descriptor, temporary_path_name = tempfile.mkstemp(prefix=temporary_prefix, dir=path.parent, text=True)
@@ -977,8 +989,7 @@ def send_message(
     rendered_destination = render_send_destination(rendered_target, thread_ts)
     if file_paths:
         file_uploads = [
-            {"file": str(file_path), "filename": file_path.name, "title": file_path.name}
-            for file_path in file_paths
+            {"file": str(file_path), "filename": file_path.name, "title": file_path.name} for file_path in file_paths
         ]
         parameters: JsonObject = {"channel": channel_id, "file_uploads": file_uploads}
         if text:
@@ -1091,7 +1102,7 @@ def format_file_size(value: Any) -> str | None:
     """Format a Slack file size."""
     try:
         size = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     units = ("B", "KB", "MB", "GB")
     display_size = float(size)
@@ -1125,9 +1136,7 @@ def format_tail_file(file: JsonObject) -> str:
     file_id = str(file.get("id") or "unknown-file")
     file_name = str(file.get("title") or file.get("name") or file_id)
     details = [
-        value
-        for value in (format_file_size(file.get("size")), file.get("mimetype") or file.get("filetype"))
-        if value
+        value for value in (format_file_size(file.get("size")), file.get("mimetype") or file.get("filetype")) if value
     ]
     detail_text = f" ({', '.join(str(detail) for detail in details)})" if details else ""
     return f"[file {file_id}: {file_name}{detail_text}]"
@@ -1300,6 +1309,7 @@ def resolve_message_channel_reference(format_context: MessageFormatContext, chan
 
 def format_slack_references(value: str, format_context: MessageFormatContext) -> str:
     """Format Slack user and channel references."""
+
     def replace_user(match: re.Match[str]) -> str:
         return resolve_message_user_reference(format_context, match.group(1))
 
@@ -1447,7 +1457,10 @@ def output_lines(lines: list[str]) -> None:
 @click.option(
     "--workspace",
     "-w",
-    help="Slack workspace URL or subdomain. Overrides the value from `slaick set-workspace` when fetching a new token.",
+    help=(
+        "Slack workspace URL or subdomain. Overrides the value from "
+        "`slack-tool.py set-workspace` when fetching a new token."
+    ),
 )
 @click.pass_context
 def cli(click_context: click.Context, workspace: str | None) -> None:
