@@ -1,11 +1,11 @@
 ---
-name: slack-client
+name: use-slack
 description: Interact with Slack. Use when you need to search, send, read, or listen for Slack messages. This can also be used to discover Slack users and channels.
 ---
 
 # slack-client
 
-Use `scripts/slaick` from this repository.
+Use `scripts/slaick` from this skill.
 
 ```bash
 scripts/slaick --help
